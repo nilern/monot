@@ -24,6 +24,7 @@
 (def ^{:private true, :dynamic true} pure)
 
 (defprotocol ContEmitter
+  (trivial-cont? [self])
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
@@ -34,6 +35,7 @@
 
 (deftype FnCont [-continue-expr -continue-computation]
   ContEmitter
+  (trivial-cont? [_] false)
   (continue-expr [_ expr] (-continue-expr expr))
   (continue-computation [_ computation] (-continue-computation computation)))
 
@@ -45,20 +47,23 @@
 
 (deftype ComputationCont [inner]
   ContEmitter
+  (trivial-cont? [_] false)
   (continue-expr [_ expr] (continue-computation inner expr))
   (continue-computation [_ computation] (continue-computation inner computation)))
 
-; (deftype NamedCont [name]
-;   ContEmitter
-;   (continue-expr [_ expr] `(~name ~expr))
-;   (continue-computation [_ computation] `(flat-map ~computation ~name)))
+(deftype NamedCont [name]
+  ContEmitter
+  (trivial-cont? [_] true)
+  (continue-expr [_ expr] `(~name ~expr))
+  (continue-computation [_ computation] `(flat-map ~computation ~name)))
 
 (deftype TailCont []
   ContEmitter
+  (trivial-cont? [_] true)
   (continue-expr [_ expr] `(~pure ~expr))
   (continue-computation [_ computation] computation))
 
-(declare convert-do convert-call convert-args)
+(declare convert-if convert-do convert-call convert-args)
 
 (defn- convert [form cont]
   (if (computation? form)
@@ -67,11 +72,22 @@
         !  (do
              (assert (= (count form) 2))
              (convert (second form) (->ComputationCont cont)))
-        if (assert false "unimplemented")
+        if (convert-if form cont)
         do (convert-do form cont)
         (convert-call form cont))
       (assert false "unreachable"))
     (continue cont form)))
+
+(defn convert-if [[_ condition then else] cont]
+  (if (trivial-cont? cont)
+    (convert condition
+             (make-cont (fn [c] `(if ~c ~(convert then cont) ~(convert else cont)))))
+    (let [k     (gensym 'k)
+          v     (gensym 'v)
+          cont* (->NamedCont k)]
+      `(let [~k (fn [~v] ~(continue cont v))]
+         ~(convert condition
+                   (make-cont (fn [c] `(if ~c ~(convert then cont*) ~(convert else cont*)))))))))
 
 (defn- convert-do [[_ & stmts :as form] cont]
   (case (count stmts)
