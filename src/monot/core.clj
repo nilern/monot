@@ -1,15 +1,19 @@
 (ns monot.core
   (:require [clojure.walk :refer [postwalk]]))
 
+;;;;
+
 (defprotocol FlatMap
   (flat-map [self f]))
 
-(def ^:private trivial? (complement seq?))
+;;;;
 
 (def ^:private computation? (comp ::computation? meta))
 
 (defn- annotate-computation [form]
   (with-meta form (assoc (meta form) ::computation? true)))
+
+;;;;
 
 (defn- analyze-effects-1 [form]
   (if (and (seq? form)
@@ -21,10 +25,21 @@
 (defn- analyze-effects [form]
   (postwalk analyze-effects-1 form))
 
+;;;;
+
 (def ^{:private true, :dynamic true} pure)
 
+(defprotocol IsTrivial
+  (trivial? [self]))
+
+(extend-protocol IsTrivial
+  nil
+  (trivial? [_] true)
+
+  Object
+  (trivial? [self] (not (seq? self))))
+
 (defprotocol ContEmitter
-  (trivial-cont? [self])
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
@@ -34,8 +49,10 @@
     (continue-expr cont form)))
 
 (deftype FnCont [-continue-expr -continue-computation]
+  IsTrivial
+  (trivial? [_] false)
+
   ContEmitter
-  (trivial-cont? [_] false)
   (continue-expr [_ expr] (-continue-expr expr))
   (continue-computation [_ computation] (-continue-computation computation)))
 
@@ -46,20 +63,26 @@
                 `(flat-map ~computation (fn [~v] ~(continue-expr-fn v)))))))
 
 (deftype ComputationCont [inner]
+  IsTrivial
+  (trivial? [_] false)
+
   ContEmitter
-  (trivial-cont? [_] false)
   (continue-expr [_ expr] (continue-computation inner expr))
   (continue-computation [_ computation] (continue-computation inner computation)))
 
 (deftype NamedCont [name]
+  IsTrivial
+  (trivial? [_] true)
+
   ContEmitter
-  (trivial-cont? [_] true)
   (continue-expr [_ expr] `(~name ~expr))
   (continue-computation [_ computation] `(flat-map ~computation ~name)))
 
 (deftype TailCont []
+  IsTrivial
+  (trivial? [_] true)
+
   ContEmitter
-  (trivial-cont? [_] true)
   (continue-expr [_ expr] `(~pure ~expr))
   (continue-computation [_ computation] computation))
 
@@ -78,8 +101,8 @@
       (assert false "unreachable"))
     (continue cont form)))
 
-(defn convert-if [[_ condition then else] cont]
-  (if (trivial-cont? cont)
+(defn- convert-if [[_ condition then else] cont]
+  (if (trivial? cont)
     (convert condition
              (make-cont (fn [c] `(if ~c ~(convert then cont) ~(convert else cont)))))
     (let [k     (gensym 'k)
@@ -113,6 +136,8 @@
                                    (let [a (gensym 'a)]
                                      `(let [~a ~arg]
                                         ~(convert-args (cons a args) argfs cont))))))))))
+
+;;;;
 
 (defmacro in-monad [return & body]
   (binding [pure return]
