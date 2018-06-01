@@ -43,11 +43,6 @@
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
-(defn- continue [cont form]
-  (if (computation? form)
-    (continue-computation cont form)
-    (continue-expr cont form)))
-
 (deftype FnCont [-continue-expr -continue-computation]
   IsTrivial
   (trivial? [_] false)
@@ -55,12 +50,6 @@
   ContEmitter
   (continue-expr [_ expr] (-continue-expr expr))
   (continue-computation [_ computation] (-continue-computation computation)))
-
-(defn- make-cont [continue-expr-fn]
-  (->FnCont continue-expr-fn
-            (fn [computation]
-              (let [v (gensym 'v)]
-                `(flat-map ~computation (fn [~v] ~(continue-expr-fn v)))))))
 
 (deftype ComputationCont [inner]
   IsTrivial
@@ -86,6 +75,33 @@
   (continue-expr [_ expr] `(~pure ~expr))
   (continue-computation [_ computation] computation))
 
+(defn- make-cont [continue-expr-fn]
+  (->FnCont continue-expr-fn
+            (fn [computation]
+              (let [v (gensym 'v)]
+                `(flat-map ~computation (fn [~v] ~(continue-expr-fn v)))))))
+
+(defn- continue [cont form]
+  (if (computation? form)
+    (continue-computation cont form)
+    (continue-expr cont form)))
+
+(defn- trivializing [v f]
+  (if (trivial? v)
+    (f v)
+    (let [x (gensym 'x)]
+      `(let [~x ~v]
+         ~(f x)))))
+
+(defn- trivializing-cont [v f]
+  (if (trivial? v)
+    (f v)
+    (let [k     (gensym 'k)
+          x     (gensym 'x)
+          cont* (->NamedCont k)]
+      `(let [~k (fn [~x] ~(continue v x))]
+         ~(f cont*)))))
+
 (declare convert-if convert-do convert-call convert-args)
 
 (defn- convert [form cont]
@@ -102,15 +118,13 @@
     (continue cont form)))
 
 (defn- convert-if [[_ condition then else] cont]
-  (if (trivial? cont)
-    (convert condition
-             (make-cont (fn [c] `(if ~c ~(convert then cont) ~(convert else cont)))))
-    (let [k     (gensym 'k)
-          v     (gensym 'v)
-          cont* (->NamedCont k)]
-      `(let [~k (fn [~v] ~(continue cont v))]
-         ~(convert condition
-                   (make-cont (fn [c] `(if ~c ~(convert then cont*) ~(convert else cont*)))))))))
+  (trivializing-cont cont
+                     (fn [cont]
+                       (convert condition
+                                (make-cont (fn [c]
+                                             `(if ~c
+                                                ~(convert then cont)
+                                                ~(convert else cont))))))))
 
 (defn- convert-do [[_ & stmts :as form] cont]
   (case (count stmts)
@@ -131,11 +145,9 @@
     (continue cont args)
     (let [[argf & argfs] argfs]
       (convert argf (make-cont (fn [arg]
-                                 (if (trivial? arg)
-                                   (convert-args (cons arg args) argfs cont)
-                                   (let [a (gensym 'a)]
-                                     `(let [~a ~arg]
-                                        ~(convert-args (cons a args) argfs cont))))))))))
+                                 (trivializing arg
+                                               (fn [arg]
+                                                 (convert-args (cons arg args) argfs cont)))))))))
 
 ;;;;
 
