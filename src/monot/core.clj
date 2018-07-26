@@ -19,7 +19,7 @@
   (if (and (seq? form)
            (or (= (first form) '!)
                (some computation? form)))
-      (annotate-computation form)
+    (annotate-computation form)
     form))
 
 (defn- analyze-effects [form]
@@ -96,8 +96,8 @@
 (defn- trivializing-cont [v f]
   (if (trivial? v)
     (f v)
-    (let [k     (gensym 'k)
-          x     (gensym 'x)
+    (let [k (gensym 'k)
+          x (gensym 'x)
           cont* (->NamedCont k)]
       `(let [~k (fn [~x] ~(continue v x))]
          ~(f cont*)))))
@@ -108,9 +108,9 @@
   (if (computation? form)
     (if (seq form)
       (case (first form)
-        !  (do
-             (assert (= (count form) 2))
-             (convert (second form) (->ComputationCont cont)))
+        ! (do
+            (assert (= (count form) 2))
+            (convert (second form) (->ComputationCont cont)))
         if (convert-if form cont)
         do (convert-do form cont)
         (convert-call form cont))
@@ -130,7 +130,7 @@
   (case (count stmts)
     0 (convert nil cont)
     1 (convert (first stmts) cont)
-    (convert-call form cont))) ; HACK and does not respect tail conts
+    (convert-call form cont)))                              ; HACK and does not respect tail conts
 
 (defn- convert-call [[ff & argfs] cont]
   (convert ff
