@@ -3,8 +3,6 @@
             [monot.core-ana :refer [in-monad pure FlatMap]])
   (:import [clojure.lang PersistentVector]))
 
-(defmethod pure PersistentVector [_ value] [value])
-
 (extend-type PersistentVector
   FlatMap
   (flat-map [self f] (into [] (mapcat f) self)))
