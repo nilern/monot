@@ -1,7 +1,7 @@
 (ns monot.core-ana
   (:require [clojure.tools.analyzer.jvm :as ana]
             [clojure.tools.analyzer.passes.jvm.emit-form :refer [emit-form]])
-  (:import [clojure.lang IDeref]))
+  (:import [clojure.lang IDeref APersistentMap]))
 
 ;;;; tools.analyzer Utils
 ;;;; ===============================================================================================
@@ -31,6 +31,30 @@
 
 (defn- postwalk [f ast]
   (walk (partial postwalk f) f ast))
+
+(defn- next-path
+  "The next subnode of `node` in evaluation order after `path` and its path."
+  [{:keys [children] :as node} path]
+  (case (count path)
+    1 (let [child-name (first path)]
+        (when-let [path*-head (second (drop-while #(not= % child-name) children))]
+          (let [child* (path*-head node)]
+            (if (vector? child*)
+              (when (seq child*)
+                [(first child*) [path*-head 0]])
+              [child* [path*-head]]))))
+    2 (let [path* (update path 1 inc)]
+        (if-let [child* (get-in node path*)]
+          [child* path*]
+          (recur node (subvec path 0 1))))))
+
+(defn- assoc-subnode [node [field :as path] subnode]
+  (case (count path)
+    1 (assoc node field subnode)
+    2 (update node field (fn [children]
+                           (if children
+                             (conj children subnode)
+                             [subnode])))))
 
 ;;;; Monad Interface
 ;;;; ===============================================================================================
@@ -68,17 +92,34 @@
 (defprotocol IsTrivial
   (trivial? [self]))
 
+(extend-protocol IsTrivial
+  APersistentMap
+  (trivial? [{:keys [op]}]
+    (case op
+      (:const :local :quote :the-var) true
+      false)))
+
 (defprotocol ContEmitter
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
-(deftype NodeCont [orig-node                                ; The unconverted AST node
+(declare convert trivializing)
+
+(deftype NodeCont [parent                                   ; The parent continuation of this
+                   orig-node                                ; The unconverted AST node
+                   new-node                                 ; The (partial) converted AST node
                    path]                                    ; Path to the subnode whose conversion this is waiting for
   IsTrivial
   (trivial? [_] false)
 
   ContEmitter
-  (continue-expr [_ expr] (assert false "unimplemented"))
+  (continue-expr [_ expr]
+    (trivializing expr (fn [aexpr]
+                         (let [new-node (assoc-subnode new-node path aexpr)]
+                           (if-let [[subnode path*] (next-path orig-node path)]
+                             (convert (->NodeCont parent orig-node new-node path*) subnode)
+                             (continue parent (merge orig-node new-node)))))))
+
   (continue-computation [_ computation] (assert false "unimplemented")))
 
 (deftype NamedCont [cont-ref]
@@ -107,10 +148,35 @@
 
 (defmulti convert-monadic (fn [_cont ast] (:op ast)))
 
+(defmethod convert-monadic :invoke [cont {f :fn :as ast}]
+  (convert (->NodeCont cont ast {} [:fn]) f))
+
 (defn- convert [cont ast]
   (if (monadic? ast)
     (convert-monadic cont ast)
     (continue-expr cont ast)))
+
+(defn- trivializing [expr f]
+  (if (trivial? expr)
+    (f expr)
+    (let [name (gensym 'v)
+          aatom (atom nil)
+          aexpr {:op          :local
+                 :form        name
+                 :name        name
+                 :assignable? false
+                 :local       :let
+                 :atom        aatom}]
+      {:op       :let
+       :bindings [{:op       :binding
+                   :form     name
+                   :name     name
+                   :local    :let
+                   :init     expr
+                   :atom     aatom
+                   :children [:init]}]
+       :body     (f aexpr)
+       :children [:bindings :body]})))
 
 ;;;; Syntax Extensions
 ;;;; ===============================================================================================
@@ -131,7 +197,8 @@
                             :form  pure-name
                             :name  pure-name
                             :local :let
-                            :init  (ana/analyze pure (assoc (ana/empty-env) :locals let-locals))}]
+                            :init  (ana/analyze pure (assoc (ana/empty-env) :locals let-locals))
+                            :children []}]
                 :body     (->> (ana/analyze `(do ~@body) (assoc (ana/empty-env) :locals body-locals))
                                annotate-effects
                                (convert (->TailCont pure-ref)))
