@@ -46,14 +46,6 @@
           [child* path*]
           (recur node (subvec path 0 1))))))
 
-(defn- assoc-subnode [node [field :as path] subnode]
-  (case (count path)
-    1 (assoc node field subnode)
-    2 (update node field (fn [children]
-                           (if children
-                             (conj children subnode)
-                             [subnode])))))
-
 ;;;; Monad Interface
 ;;;; ===============================================================================================
 
@@ -110,32 +102,28 @@
 
 (declare ->NodeCont convert continue trivializing emit-bind)
 
-(deftype NodeCont [parent                                   ; The parent continuation of this
-                   orig-node                                ; The unconverted AST node
-                   new-node                                 ; The (partial) converted AST node
-                   path]                                    ; Path to the subnode whose conversion this is waiting for
+(deftype NodeCont [parent    ; The parent continuation of this
+                   orig-node ; The unconverted AST node
+                   new-node  ; The (partial) converted AST node
+                   path]      ; Path to the subnode whose conversion this is waiting for
   IsTrivial
   (trivial? [_] false)
 
   ContEmitter
   (continue-expr [_ expr]
     (trivializing expr (fn [aexpr]
-                         (let [new-node (assoc-subnode new-node path aexpr)]
+                         (let [new-node (assoc-in new-node path aexpr)]
                            (if-let [[subnode path*] (next-path orig-node path)]
                              (convert (->NodeCont parent orig-node new-node path*) subnode)
-                             (if (!-node? orig-node)
-                               (continue-computation parent (merge orig-node new-node))
-                               (continue parent (merge orig-node new-node))))))))
+                             (continue parent new-node))))))
 
   (continue-computation [_ computation]
     (emit-bind computation
       (fn [acomp]
-        (let [new-node (assoc-subnode new-node path acomp)]
+        (let [new-node (assoc-in new-node path acomp)]
           (if-let [[subnode path*] (next-path orig-node path)]
             (convert (->NodeCont parent orig-node new-node path*) subnode)
-            (if (!-node? orig-node)
-              (continue-computation parent (merge orig-node new-node))
-              (continue parent (merge orig-node new-node)))))))))
+            (continue parent new-node)))))))
 
 (deftype BindCont [parent]
   IsTrivial
@@ -171,16 +159,39 @@
 
 (defmulti convert-monadic (fn [_cont ast] (:op ast)))
 
-(defmethod convert-monadic :invoke [cont {f :fn :as ast}]
+(defmethod convert-monadic :host-interop [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
+
+(defmethod convert-monadic :instance? [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
+
+(defmethod convert-monadic :instance-call [cont {:keys [instance] :as ast}]
+  (convert (->NodeCont cont ast ast [:instance]) instance))
+
+(defmethod convert-monadic :instance-field [cont {:keys [instance] :as ast}]
+  (convert (->NodeCont cont ast ast [:instance]) instance))
+
+(defmethod convert-monadic :invoke [cont {f :fn [computation] :args :as ast}]
   (if (!-node? ast)
-    (let [{[computation :as args] :args} ast]
-      (assert (= (count args) 1))
-      (convert (->BindCont cont) computation))
-  (convert (->NodeCont cont ast {} [:fn]) f)))
+    (convert (->BindCont cont) computation)
+    (convert (->NodeCont cont ast ast [:fn]) f)))
+
+(defmethod convert-monadic :primitive-invoke [cont {f :fn [computation] :args :as ast}]
+  (if (!-node? ast)
+    (convert (->BindCont cont) computation)
+    (convert (->NodeCont cont ast ast [:fn]) f)))
+
+(defmethod convert-monadic :protocol-invoke [cont {f :protocol-fn [computation] :args :as ast}]
+  (if (!-node? ast)
+    (convert (->BindCont cont) computation)
+    (convert (->NodeCont cont ast ast [:protocol-fn]) f)))
+
+(defmethod convert-monadic :static-call [cont {[arg] :args :as ast}]
+  (convert (->NodeCont cont ast ast [:args 0]) arg))
 
 (defmethod convert-monadic :vector [cont {[item :as items] :items :as ast}]
   (if (seq items)
-    (convert (->NodeCont cont ast {} [:items 0]) item)
+    (convert (->NodeCont cont ast ast [:items 0]) item)
     (continue cont ast)))
 
 (defn- convert [cont ast]
