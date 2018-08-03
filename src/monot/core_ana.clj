@@ -103,7 +103,7 @@
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
-(declare convert trivializing)
+(declare ->NodeCont convert continue trivializing trivializing-computation)
 
 (deftype NodeCont [parent                                   ; The parent continuation of this
                    orig-node                                ; The unconverted AST node
@@ -118,9 +118,33 @@
                          (let [new-node (assoc-subnode new-node path aexpr)]
                            (if-let [[subnode path*] (next-path orig-node path)]
                              (convert (->NodeCont parent orig-node new-node path*) subnode)
-                             (continue parent (merge orig-node new-node)))))))
+                             (if (and (= (:op orig-node) :invoke)
+                                      (= (-> orig-node :fn :op) :var)
+                                      (= (-> orig-node :fn :var) #'!))
+                               (do (assert (= (count (:args orig-node)) 1))
+                                   (continue-computation parent (merge orig-node new-node)))
+                               (continue parent (merge orig-node new-node))))))))
 
-  (continue-computation [_ computation] (assert false "unimplemented")))
+  (continue-computation [_ computation]
+    (trivializing-computation computation
+      (fn [acomp]
+        (let [new-node (assoc-subnode new-node path acomp)]
+          (if-let [[subnode path*] (next-path orig-node path)]
+            (convert (->NodeCont parent orig-node new-node path*) subnode)
+            (if (and (= (:op orig-node) :invoke)
+                     (= (-> orig-node :fn :op) :var)
+                     (= (-> orig-node :fn :var) #'!))
+              (do (assert (= (count (:args orig-node)) 1))
+                  (continue-computation parent (merge orig-node new-node)))
+              (continue parent (merge orig-node new-node)))))))))
+
+(deftype BindCont [parent]
+  IsTrivial
+  (trivial? [_] false)
+
+  ContEmitter
+  (continue-expr [_ expr] (continue-computation parent expr))
+  (continue-computation [_ computation] (continue-computation parent computation)))
 
 (deftype NamedCont [cont-ref]
   IsTrivial
@@ -149,7 +173,16 @@
 (defmulti convert-monadic (fn [_cont ast] (:op ast)))
 
 (defmethod convert-monadic :invoke [cont {f :fn :as ast}]
-  (convert (->NodeCont cont ast {} [:fn]) f))
+  (if (and (= (:op f) :var) (= (:var f) #'!))
+    (let [{[computation :as args] :args} ast]
+      (assert (= (count args) 1))
+      (convert (->BindCont cont) computation))
+  (convert (->NodeCont cont ast {} [:fn]) f)))
+
+(defmethod convert-monadic :vector [cont {[item :as items] :items :as ast}]
+  (if (seq items)
+    (convert (->NodeCont cont ast {} [:items 0]) item)
+    (continue cont ast)))
 
 (defn- convert [cont ast]
   (if (monadic? ast)
@@ -177,6 +210,48 @@
                    :children [:init]}]
        :body     (f aexpr)
        :children [:bindings :body]})))
+
+(defn- trivializing-computation [computation f]
+  (let [name (gensym 'v)
+        aatom (atom nil)
+        acomp {:op          :local
+               :form        name
+               :name        name
+               :assignable? false
+               :local       :arg
+               :arg-id      0
+               :variadic?   false
+               :atom        aatom}
+        recur-label (gensym 'recur)]
+    {:op :invoke
+     :fn {:op :var
+          :form `flat-map
+          :var #'flat-map}
+     :args [computation
+            {:op :fn
+             :variadic? false
+             :max-fixed-arity 1
+             :methods [{:op :fn-method
+                        :loop-id recur-label
+                        :variadic? false
+                        :params [{:op :binding
+                                  :form name
+                                  :name name
+                                  :local :arg
+                                  :arg-id 0
+                                  :variadic? false
+                                  :atom aatom
+                                  :children []}]
+                        :fixed-arity 1
+                        :body {:op :do
+                               :statements []
+                               :ret (f acomp)
+                               :body? true
+                               :children [:statements :ret]}
+                        :children [:params :body]}]
+             :once false
+             :children [:methods]}]
+     :children [:fn :args]}))
 
 ;;;; Syntax Extensions
 ;;;; ===============================================================================================
