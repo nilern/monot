@@ -20,9 +20,7 @@
   (if-let [child-names (:children ast)]
     (reduce (fn [ast child-name]
               (let [child (child-name ast)]
-                (if (vector? child)
-                  (assoc ast child-name (mapv f child))
-                  (assoc ast child-name (f child)))))
+                (assoc ast child-name (if (vector? child) (mapv f child) (f child)))))
             ast child-names)
     ast))
 
@@ -84,6 +82,13 @@
 
 (def ^:private annotate-effects (partial postwalk annotate-node-effects))
 
+(defn- !-node? [node]
+  (let [res (and (= (:op node) :invoke)
+                 (= (-> node :fn :op) :var)
+                 (= (-> node :fn :var) #'!))]
+    (assert (or (not res) (= (count (:args node)) 1)))
+    res))
+
 ;;;; Monadic Conversion
 ;;;; ===============================================================================================
 
@@ -103,7 +108,7 @@
   (continue-expr [self expr])
   (continue-computation [self computation]))
 
-(declare ->NodeCont convert continue trivializing trivializing-computation)
+(declare ->NodeCont convert continue trivializing emit-bind)
 
 (deftype NodeCont [parent                                   ; The parent continuation of this
                    orig-node                                ; The unconverted AST node
@@ -118,24 +123,18 @@
                          (let [new-node (assoc-subnode new-node path aexpr)]
                            (if-let [[subnode path*] (next-path orig-node path)]
                              (convert (->NodeCont parent orig-node new-node path*) subnode)
-                             (if (and (= (:op orig-node) :invoke)
-                                      (= (-> orig-node :fn :op) :var)
-                                      (= (-> orig-node :fn :var) #'!))
-                               (do (assert (= (count (:args orig-node)) 1))
-                                   (continue-computation parent (merge orig-node new-node)))
+                             (if (!-node? orig-node)
+                               (continue-computation parent (merge orig-node new-node))
                                (continue parent (merge orig-node new-node))))))))
 
   (continue-computation [_ computation]
-    (trivializing-computation computation
+    (emit-bind computation
       (fn [acomp]
         (let [new-node (assoc-subnode new-node path acomp)]
           (if-let [[subnode path*] (next-path orig-node path)]
             (convert (->NodeCont parent orig-node new-node path*) subnode)
-            (if (and (= (:op orig-node) :invoke)
-                     (= (-> orig-node :fn :op) :var)
-                     (= (-> orig-node :fn :var) #'!))
-              (do (assert (= (count (:args orig-node)) 1))
-                  (continue-computation parent (merge orig-node new-node)))
+            (if (!-node? orig-node)
+              (continue-computation parent (merge orig-node new-node))
               (continue parent (merge orig-node new-node)))))))))
 
 (deftype BindCont [parent]
@@ -173,7 +172,7 @@
 (defmulti convert-monadic (fn [_cont ast] (:op ast)))
 
 (defmethod convert-monadic :invoke [cont {f :fn :as ast}]
-  (if (and (= (:op f) :var) (= (:var f) #'!))
+  (if (!-node? ast)
     (let [{[computation :as args] :args} ast]
       (assert (= (count args) 1))
       (convert (->BindCont cont) computation))
@@ -211,7 +210,7 @@
        :body     (f aexpr)
        :children [:bindings :body]})))
 
-(defn- trivializing-computation [computation f]
+(defn- emit-bind [computation f]
   (let [name (gensym 'v)
         aatom (atom nil)
         acomp {:op          :local
