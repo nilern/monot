@@ -130,35 +130,92 @@
                :variadic?   false
                :atom        aatom}
         recur-label (gensym 'recur)]
-    {:op       :invoke
-     :fn       {:op   :var
-                :form `flat-map
-                :var  #'flat-map}
-     :args     [computation
-                {:op              :fn
-                 :variadic?       false
-                 :max-fixed-arity 1
-                 :methods         [{:op          :fn-method
-                                    :loop-id     recur-label
-                                    :variadic?   false
-                                    :params      [{:op        :binding
-                                                   :form      name
-                                                   :name      name
-                                                   :local     :arg
-                                                   :arg-id    0
-                                                   :variadic? false
-                                                   :atom      aatom
-                                                   :children  []}]
-                                    :fixed-arity 1
-                                    :body        {:op         :do
-                                                  :statements []
-                                                  :ret        (f acomp)
-                                                  :body?      true
-                                                  :children   [:statements :ret]}
-                                    :children    [:params :body]}]
-                 :once            false
-                 :children        [:methods]}]
-     :children [:fn :args]}))
+    {:op          :protocol-invoke
+     :protocol-fn {:op   :var
+                   :form `flat-map
+                   :var  #'flat-map}
+     :target      computation
+     :args        [{:op              :fn
+                    :variadic?       false
+                    :max-fixed-arity 1
+                    :methods         [{:op          :fn-method
+                                       :loop-id     recur-label
+                                       :variadic?   false
+                                       :params      [{:op        :binding
+                                                      :form      name
+                                                      :name      name
+                                                      :local     :arg
+                                                      :arg-id    0
+                                                      :variadic? false
+                                                      :atom      aatom
+                                                      :children  []}]
+                                       :fixed-arity 1
+                                       :body        {:op         :do
+                                                     :statements []
+                                                     :ret        (f acomp)
+                                                     :body?      true
+                                                     :children   [:statements :ret]}
+                                       :children    [:params :body]}]
+                    :once            false
+                    :children        [:methods]}]
+     :children    [:fn :args]}))
+
+(declare ->NamedCont continue)
+
+(defn- trivializing-cont [cont f]
+  (if (trivial? cont)
+    (f cont)
+    (let [k (gensym 'k)
+          katom (atom nil)
+          kexpr {:op          :local
+                 :form        k
+                 :name        k
+                 :assignable? false
+                 :local       :let
+                 :atom        katom}
+          v (gensym 'v)
+          vatom (atom nil)
+          vexpr {:op          :local
+                 :form        v
+                 :name        v
+                 :assignable? false
+                 :local       :arg
+                 :arg-id      0
+                 :variadic    false
+                 :atom        vatom}
+          recur-label (gensym 'recur)]
+      {:op       :let
+       :bindings [{:op       :binding
+                   :form     k
+                   :name     k
+                   :local    :let
+                   :init     {:op              :fn
+                              :variadic?       false
+                              :max-fixed-arity 1
+                              :methods         [{:op          :fn-method
+                                                 :loop-id     recur-label
+                                                 :variadic?   false
+                                                 :params      [{:op        :binding
+                                                                :form      v
+                                                                :name      v
+                                                                :local     :arg
+                                                                :arg-id    0
+                                                                :variadic? false
+                                                                :atom      vatom
+                                                                :children  []}]
+                                                 :fixed-arity 1
+                                                 :body        {:op         :do
+                                                               :statements []
+                                                               :ret        (continue cont vexpr)
+                                                               :body?      true
+                                                               :children   [:statements :ret]}
+                                                 :children    [:params :body]}]
+                              :once            false
+                              :children        [:methods]}
+                   :atom     katom
+                   :children [:init]}]
+       :body     (f (->NamedCont kexpr))
+       :children [:bindings :body]})))
 
 (defprotocol ContEmitter
   (continue [self expr])
@@ -189,6 +246,21 @@
                      (convert (->NodeCont parent orig-node new-node path*) subnode)
                      (continue parent new-node)))))))
 
+;; FIXME: When test or then were (! ...) originally, does not emit else branch.
+(defn- convert-if-branches [cont if-ast test*]
+  (-> if-ast
+      (assoc :test test*)
+      (update :then (partial convert cont))
+      (update :else (partial convert cont))))
+
+(deftype IfCont [parent orig-node]
+  IsTrivial
+  (trivial? [_] false)
+
+  ContEmitter
+  (continue [_ expr] (convert-if-branches parent orig-node expr))
+  (continue-computation [_ computation] (emit-bind computation (partial convert-if-branches parent orig-node))))
+
 (deftype BindCont [parent]
   IsTrivial
   (trivial? [_] false)
@@ -204,8 +276,18 @@
   (trivial? [_] true)
 
   ContEmitter
-  (continue [_ expr] (assert false "unimplemented"))
-  (continue-computation [_ computation] (assert false "unimplemented")))
+  (continue [_ expr]
+    {:op       :invoke
+     :fn       cont-ref
+     :args     [expr]
+     :children [:fn :args]})
+
+  (continue-computation [_ computation] computation
+    {:op          :protocol-invoke
+     :protocol-fn {:op :var, :form `flat-map, :var #'flat-map}
+     :target      computation
+     :args        [cont-ref]
+     :children    [:protocol-fn :target :args]}))
 
 (deftype TailCont [pure-ref]
   IsTrivial
@@ -222,6 +304,9 @@
 
 (defmethod convert-monadic :host-interop [cont {:keys [target] :as ast}]
   (convert (->NodeCont cont ast ast [:target]) target))
+
+(defmethod convert-monadic :if [cont {:keys [test] :as ast}]
+  (trivializing-cont cont (fn [k] (convert (->IfCont k ast) test))))
 
 (defmethod convert-monadic :instance? [cont {:keys [target] :as ast}]
   (convert (->NodeCont cont ast ast [:target]) target))
@@ -271,15 +356,16 @@
                   :local       :let
                   :atom        pure-atom}
         let-locals (into {} (map (fn [[name _]] [name {:op :local, :form name, :name name}])) &env)
-        body-locals (assoc let-locals pure-name pure-ref)]
-    (emit-form {:op       :let
-                :bindings [{:op       :binding
-                            :form     pure-name
-                            :name     pure-name
-                            :local    :let
-                            :init     (ana/analyze pure (assoc (ana/empty-env) :locals let-locals))
-                            :children []}]
-                :body     (->> (ana/analyze `(do ~@body) (assoc (ana/empty-env) :locals body-locals))
-                               annotate-effects
-                               (convert (->TailCont pure-ref)))
-                :children [:bindings :body]})))
+        body-locals (assoc let-locals pure-name pure-ref)
+        ast {:op       :let
+             :bindings [{:op       :binding
+                         :form     pure-name
+                         :name     pure-name
+                         :local    :let
+                         :init     (ana/analyze pure (assoc (ana/empty-env) :locals let-locals))
+                         :children []}]
+             :body     (->> (ana/analyze `(do ~@body) (assoc (ana/empty-env) :locals body-locals))
+                            annotate-effects
+                            (convert (->TailCont pure-ref)))
+             :children [:bindings :body]}]
+    (emit-form ast)))
