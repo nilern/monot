@@ -246,12 +246,14 @@
                      (convert (->NodeCont parent orig-node new-node path*) subnode)
                      (continue parent new-node)))))))
 
-;; FIXME: When test or then were (! ...) originally, does not emit else branch.
 (defn- convert-if-branches [cont if-ast test*]
   (-> if-ast
       (assoc :test test*)
       (update :then (partial convert cont))
-      (update :else (partial convert cont))))
+      (update :else (fn [else-ast]
+                      (let [converted (convert cont else-ast)]
+                        ;; HACK: Must have :form, otherwise emit-form will not emit else branch:
+                        (assoc converted :form (emit-form converted)))))))
 
 (deftype IfCont [parent orig-node]
   IsTrivial
