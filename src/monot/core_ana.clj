@@ -304,20 +304,37 @@
 
 (defmulti convert-monadic (fn [_cont ast] (:op ast)))
 
+;;; TODO: Function-type things, probably no-ops: fn fn-method deftype reify method
+;;;       Local binding, probably straightforward: let letfn binding
+;;;;      Never ::monadic (?): (const quote local static-field the-var var import)
+;;;       Case, has more stuff than if but can be handled analogously: case case-test case-then
+;;;       Loop, needs to be trampolined: loop recur
+;;;       Exceptions, maybe use something like MonadError (?): try catch throw
+
+(defmethod convert-monadic :def [cont {:keys [children] :as ast}]
+  (if (seq children)
+    (convert (->NodeCont cont ast ast [(first children)]) (get ast (first children)))
+    ast))
+
+(defmethod convert-monadic :do [cont {[statement :as statements] :statements :keys [ret] :as ast}]
+  (if (seq statements)
+    (convert (->NodeCont cont ast ast [:statements 0]) statement)
+    (convert (->NodeCont cont ast ast [:ret]) ret)))
+
 (defmethod convert-monadic :host-interop [cont {:keys [target] :as ast}]
   (convert (->NodeCont cont ast ast [:target]) target))
 
 (defmethod convert-monadic :if [cont {:keys [test] :as ast}]
   (trivializing-cont cont (fn [k] (convert (->IfCont k ast) test))))
 
-(defmethod convert-monadic :instance? [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
-
 (defmethod convert-monadic :instance-call [cont {:keys [instance] :as ast}]
   (convert (->NodeCont cont ast ast [:instance]) instance))
 
 (defmethod convert-monadic :instance-field [cont {:keys [instance] :as ast}]
   (convert (->NodeCont cont ast ast [:instance]) instance))
+
+(defmethod convert-monadic :instance? [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
 
 (defmethod convert-monadic :invoke [cont {f :fn :as ast}]
   (if (!-node? ast)
@@ -326,11 +343,36 @@
       (convert (->NodeCont (->BindCont cont) ast ast arg-path) arg))
     (convert (->NodeCont cont ast ast [:fn]) f)))
 
+(defmethod convert-monadic :keyword-invoke [cont {kw :keyword :as ast}]
+  (convert (->NodeCont cont ast ast [:keyword]) kw))
+
+(defmethod convert-monadic :map [cont {[k :as keys] :keys :as ast}]
+  (if (seq keys)
+    (convert (->NodeCont cont ast ast [:keys 0]) k)
+    (continue cont ast)))
+
+(defmethod convert-monadic :monitor-enter [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
+
+(defmethod convert-monadic :monitor-exit [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
+
+(defmethod convert-monadic :new [cont {:keys [class] :as ast}]
+  (convert (->NodeCont cont ast ast [:class]) class))
+
 (defmethod convert-monadic :primitive-invoke [cont {f :fn :as ast}]
   (convert (->NodeCont cont ast ast [:fn]) f))
 
 (defmethod convert-monadic :protocol-invoke [cont {f :protocol-fn :as ast}]
   (convert (->NodeCont cont ast ast [:protocol-fn]) f))
+
+(defmethod convert-monadic :set [cont {[item :as items] :items :as ast}]
+  (if (seq items)
+    (convert (->NodeCont cont ast ast [:items 0]) item)
+    (continue cont ast)))
+
+(defmethod convert-monadic :set! [cont {:keys [target] :as ast}]
+  (convert (->NodeCont cont ast ast [:target]) target))
 
 (defmethod convert-monadic :static-call [cont {[arg] :args :as ast}]
   (convert (->NodeCont cont ast ast [:args 0]) arg))
@@ -339,6 +381,9 @@
   (if (seq items)
     (convert (->NodeCont cont ast ast [:items 0]) item)
     (continue cont ast)))
+
+(defmethod convert-monadic :with-meta [cont {:keys [meta] :as ast}]
+  (convert (->NodeCont cont ast ast [:meta]) meta))
 
 (defn- convert [cont ast]
   (if (monadic? ast)
