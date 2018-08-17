@@ -30,21 +30,41 @@
 (defn- postwalk [f ast]
   (walk (partial postwalk f) f ast))
 
+(defn- next-child-name [children child-name]
+  (second (drop-while #(not= % child-name) children)))
+
+(defn- subnode-with-path
+  "Get the first subnode under `child-name` and its path or nil when `(= (get node child-name) [])`."
+  [node child-name]
+  (let [child (get node child-name)]
+    (if (vector? child)
+      (when (seq child)
+        [(first child) [child-name 0]])
+      [child [child-name]])))
+
+(declare next-path)
+
+(defn- next-subnode-with-path [node child-name]
+  (or (subnode-with-path node child-name)
+      (next-path node [child-name])))
+
 (defn- next-path
-  "The next subnode of `node` in evaluation order after `path` and its path."
+  "The next subnode of `node` in evaluation order after `path` and its path or nil when no more subnodes remain."
   [{:keys [children] :as node} path]
   (case (count path)
     1 (let [child-name (first path)]
-        (when-let [path*-head (second (drop-while #(not= % child-name) children))]
-          (let [child* (path*-head node)]
-            (if (vector? child*)
-              (when (seq child*)
-                [(first child*) [path*-head 0]])
-              [child* [path*-head]]))))
+        (when-let [path*-head (next-child-name children child-name)]
+          (next-subnode-with-path node path*-head)))
     2 (let [path* (update path 1 inc)]
         (if-let [child* (get-in node path*)]
           [child* path*]
           (recur node (subvec path 0 1))))))
+
+(defn- first-path
+  "The first subnode of `node` and its path or nil."
+  [{:keys [children] :as node}]
+  (when-let [child-name (first children)]
+    (next-subnode-with-path node child-name)))
 
 ;;;; Monad Interface
 ;;;; ===============================================================================================
@@ -302,88 +322,38 @@
                       :children [:fn :args]})
   (continue-computation [_ computation] computation))
 
-(defmulti convert-monadic (fn [_cont ast] (:op ast)))
+(defmulti convert-monadic
+          (fn [_cont {:keys [op]}]
+            (case op
+              (:def :do :host-interop :instance-call :instance-field :instance? :keyword-invoke :map :monitor-enter
+                :monitor-exit :new :primitive-invoke :protocol-invoke :set :set! :static-call :vector :with-meta)
+              ::basic-block
 
-;;; TODO: Function-type things, probably no-ops: fn fn-method deftype reify method
+              op)))
+
+;;; TODO: Case, has more stuff than if but can be handled analogously: case case-test case-then
 ;;;       Local binding, probably straightforward: let letfn binding
-;;;;      Never ::monadic (?): (const quote local static-field the-var var import)
-;;;       Case, has more stuff than if but can be handled analogously: case case-test case-then
+;;;       Function-type things, treated like constants: fn fn-method deftype reify method
+;;;       Never ::monadic (?): (const quote local static-field the-var var import)
 ;;;       Loop, needs to be trampolined: loop recur
 ;;;       Exceptions, maybe use something like MonadError (?): try catch throw
 
-(defmethod convert-monadic :def [cont {:keys [children] :as ast}]
-  (if (seq children)
-    (convert (->NodeCont cont ast ast [(first children)]) (get ast (first children)))
+(defn- convert-basic-block [cont ast]
+  (if-let [[child path] (first-path ast)]
+    (convert (->NodeCont cont ast ast path) child)
     ast))
 
-(defmethod convert-monadic :do [cont {[statement :as statements] :statements :keys [ret] :as ast}]
-  (if (seq statements)
-    (convert (->NodeCont cont ast ast [:statements 0]) statement)
-    (convert (->NodeCont cont ast ast [:ret]) ret)))
-
-(defmethod convert-monadic :host-interop [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
+(defmethod convert-monadic ::basic-block [cont ast] (convert-basic-block cont ast))
 
 (defmethod convert-monadic :if [cont {:keys [test] :as ast}]
   (trivializing-cont cont (fn [k] (convert (->IfCont k ast) test))))
 
-(defmethod convert-monadic :instance-call [cont {:keys [instance] :as ast}]
-  (convert (->NodeCont cont ast ast [:instance]) instance))
-
-(defmethod convert-monadic :instance-field [cont {:keys [instance] :as ast}]
-  (convert (->NodeCont cont ast ast [:instance]) instance))
-
-(defmethod convert-monadic :instance? [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
-
-(defmethod convert-monadic :invoke [cont {f :fn :as ast}]
+(defmethod convert-monadic :invoke [cont ast]
   (if (!-node? ast)
-    (let [[arg arg-path] (next-path ast [:fn])]             ; Skip `f` to avoid generating any references to `!`.
+    (let [[arg arg-path] (next-path ast [:fn])]             ; Skip :fn to avoid generating any references to `!`.
       ;; Use ->BindCont to redirect `continue` calls to `continue-computation`:
       (convert (->NodeCont (->BindCont cont) ast ast arg-path) arg))
-    (convert (->NodeCont cont ast ast [:fn]) f)))
-
-(defmethod convert-monadic :keyword-invoke [cont {kw :keyword :as ast}]
-  (convert (->NodeCont cont ast ast [:keyword]) kw))
-
-(defmethod convert-monadic :map [cont {[k :as keys] :keys :as ast}]
-  (if (seq keys)
-    (convert (->NodeCont cont ast ast [:keys 0]) k)
-    (continue cont ast)))
-
-(defmethod convert-monadic :monitor-enter [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
-
-(defmethod convert-monadic :monitor-exit [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
-
-(defmethod convert-monadic :new [cont {:keys [class] :as ast}]
-  (convert (->NodeCont cont ast ast [:class]) class))
-
-(defmethod convert-monadic :primitive-invoke [cont {f :fn :as ast}]
-  (convert (->NodeCont cont ast ast [:fn]) f))
-
-(defmethod convert-monadic :protocol-invoke [cont {f :protocol-fn :as ast}]
-  (convert (->NodeCont cont ast ast [:protocol-fn]) f))
-
-(defmethod convert-monadic :set [cont {[item :as items] :items :as ast}]
-  (if (seq items)
-    (convert (->NodeCont cont ast ast [:items 0]) item)
-    (continue cont ast)))
-
-(defmethod convert-monadic :set! [cont {:keys [target] :as ast}]
-  (convert (->NodeCont cont ast ast [:target]) target))
-
-(defmethod convert-monadic :static-call [cont {[arg] :args :as ast}]
-  (convert (->NodeCont cont ast ast [:args 0]) arg))
-
-(defmethod convert-monadic :vector [cont {[item :as items] :items :as ast}]
-  (if (seq items)
-    (convert (->NodeCont cont ast ast [:items 0]) item)
-    (continue cont ast)))
-
-(defmethod convert-monadic :with-meta [cont {:keys [meta] :as ast}]
-  (convert (->NodeCont cont ast ast [:meta]) meta))
+    (convert-basic-block cont ast)))
 
 (defn- convert [cont ast]
   (if (monadic? ast)
