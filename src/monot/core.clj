@@ -266,6 +266,20 @@
                      (convert (->NodeCont parent orig-node new-node path*) subnode)
                      (continue parent new-node)))))))
 
+(defn- convert-case-branches [cont case-ast test*]
+  (-> case-ast
+      (assoc :test test*)
+      (update :thens (partial mapv (partial convert cont)))
+      (update :default (partial convert cont))))
+
+(deftype CaseCont [parent orig-node]
+  IsTrivial
+  (trivial? [_] false)
+
+  ContEmitter
+  (continue [_ expr] (convert-case-branches parent orig-node expr))
+  (continue-computation [_ computation] (emit-bind computation (partial convert-case-branches parent orig-node))))
+
 (defn- convert-if-branches [cont if-ast test*]
   (-> if-ast
       (assoc :test test*)
@@ -331,8 +345,7 @@
 
               op)))
 
-;;; TODO: Case, has more stuff than if but can be handled analogously: case case-test case-then
-;;;       Local binding, probably straightforward: let letfn binding
+;;; TODO: Local binding, probably straightforward: let letfn binding
 ;;;       Function-type things, treated like constants: fn fn-method deftype reify method
 ;;;       Never ::monadic (?): (const quote local static-field the-var var import)
 ;;;       Loop, needs to be trampolined: loop recur
@@ -344,6 +357,9 @@
     ast))
 
 (defmethod convert-monadic ::basic-block [cont ast] (convert-basic-block cont ast))
+
+(defmethod convert-monadic :case [cont {:keys [test] :as ast}]
+  (trivializing-cont cont (fn [k] (convert (->CaseCont k ast) test))))
 
 (defmethod convert-monadic :if [cont {:keys [test] :as ast}]
   (trivializing-cont cont (fn [k] (convert (->IfCont k ast) test))))
