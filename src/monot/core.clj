@@ -66,18 +66,8 @@
   (when-let [child-name (first children)]
     (next-subnode-with-path node child-name)))
 
-;;;; Monad Interface
-;;;; ===============================================================================================
-
-(defprotocol FlatMap
-  (flat-map [self f]))
-
 ;;;; Workarounds
 ;;;; ===============================================================================================
-
-(deftype MonadThunk [mvalue f]
-  IDeref
-  (deref [_] (flat-map mvalue f)))
 
 (defn ! [_] (assert false "monot.core-ana/! used outside monot.core-ana/in-monad"))
 
@@ -105,6 +95,8 @@
 ;;;; ===============================================================================================
 
 ;;; It's kind of like CPS conversion.
+
+(def ^{:private true, :dynamic true} *bind-ref* nil)
 
 (defprotocol IsTrivial
   (trivial? [self]))
@@ -164,9 +156,7 @@
                 :atom        (:atom binding)}
          recur-label (gensym 'recur)]
      {:op          :protocol-invoke
-      :protocol-fn {:op   :var
-                    :form `flat-map
-                    :var  #'flat-map}
+      :protocol-fn *bind-ref*
       :target      computation
       :args        [{:op              :fn
                      :variadic?       false
@@ -349,7 +339,7 @@
 
   (continue-computation [_ computation] computation
     {:op          :protocol-invoke
-     :protocol-fn {:op :var, :form `flat-map, :var #'flat-map}
+     :protocol-fn *bind-ref*
      :target      computation
      :args        [cont-ref]
      :children    [:protocol-fn :target :args]}))
@@ -377,8 +367,7 @@
 
               op)))
 
-;;; TODO: Local binding, probably straightforward: letfn
-;;;       Function-type things, treated like constants: fn fn-method deftype reify method
+;;; TODO: Function-type things, treated like constants: fn fn-method deftype reify method
 ;;;       Never ::monadic (?): (const quote local static-field the-var var import)
 ;;;       Loop, needs to be trampolined: loop recur
 ;;;       Exceptions, maybe usdo b <-e something like MonadError (?): try catch throw
@@ -416,26 +405,39 @@
 ;;;; Syntax Extensions
 ;;;; ===============================================================================================
 
-(defmacro in-monad [pure & body]
+(defmacro in-monad [pure bind & body]
   (let [pure-name (gensym 'pure)
-        pure-atom (atom nil)
         pure-ref {:op          :local
                   :form        pure-name
                   :assignable? false
                   :name        pure-name
                   :local       :let
-                  :atom        pure-atom}
+                  :atom        (atom nil)}
+        bind-name (gensym 'bind)
+        bind-ref {:op          :local
+                  :form        bind-name
+                  :assignable? false
+                  :name        bind-name
+                  :local       :let
+                  :atom        (atom nil)}
         let-locals (into {} (map (fn [[name _]] [name {:op :local, :form name, :name name}])) &env)
-        body-locals (assoc let-locals pure-name pure-ref)
+        body-locals (assoc let-locals pure-name pure-ref bind-name bind-ref)
         ast {:op       :let
              :bindings [{:op       :binding
                          :form     pure-name
                          :name     pure-name
                          :local    :let
                          :init     (ana/analyze pure (assoc (ana/empty-env) :locals let-locals))
-                         :children []}]
-             :body     (->> (ana/analyze `(do ~@body) (assoc (ana/empty-env) :locals body-locals))
-                            annotate-effects
-                            (convert (->TailCont pure-ref)))
+                         :children [:init]}
+                        {:op       :binding
+                         :form     bind-name
+                         :name     bind-name
+                         :local    :let
+                         :init     (ana/analyze bind (assoc (ana/empty-env) :locals let-locals))
+                         :children [:init]}]
+             :body     (binding [*bind-ref* bind-ref]
+                         (->> (ana/analyze `(do ~@body) (assoc (ana/empty-env) :locals body-locals))
+                              annotate-effects
+                              (convert (->TailCont pure-ref))))
              :children [:bindings :body]}]
     (emit-form ast)))
