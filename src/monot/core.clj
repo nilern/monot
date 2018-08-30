@@ -116,69 +116,75 @@
       (:const :local :quote :the-var) true
       false)))
 
-(defn- trivializing [expr f]
-  (if (trivial? expr)
-    (f expr)
-    (let [name (gensym 'v)
-          aatom (atom nil)
-          aexpr {:op          :local
-                 :form        name
-                 :name        name
-                 :assignable? false
-                 :local       :let
-                 :atom        aatom}]
-      {:op       :let
-       :bindings [{:op       :binding
-                   :form     name
-                   :name     name
-                   :local    :let
-                   :init     expr
-                   :atom     aatom
-                   :children [:init]}]
-       :body     (f aexpr)
-       :children [:bindings :body]})))
+(defn- trivializing
+  ([expr f]
+   (if (trivial? expr)
+     (f expr)
+     (let [name (gensym 'v)
+           binding {:op       :binding
+                    :form     name
+                    :name     name
+                    :local    :let
+                    :init     expr
+                    :atom     (atom nil)
+                    :children [:init]}]
+       (trivializing expr binding f))))
+  ([expr binding f]
+   (let [aexpr {:op          :local
+                :form        (:name binding)
+                :name        (:name binding)
+                :assignable? false
+                :local       :let
+                :atom        (:atom binding)}]
+     {:op       :let
+      :bindings [(assoc binding :init expr)]
+      :body     (f aexpr)
+      :children [:bindings :body]})))
 
-(defn- emit-bind [computation f]
-  (let [name (gensym 'v)
-        aatom (atom nil)
-        acomp {:op          :local
-               :form        name
-               :name        name
-               :assignable? false
-               :local       :arg
-               :arg-id      0
-               :variadic?   false
-               :atom        aatom}
-        recur-label (gensym 'recur)]
-    {:op          :protocol-invoke
-     :protocol-fn {:op   :var
-                   :form `flat-map
-                   :var  #'flat-map}
-     :target      computation
-     :args        [{:op              :fn
-                    :variadic?       false
-                    :max-fixed-arity 1
-                    :methods         [{:op          :fn-method
-                                       :loop-id     recur-label
-                                       :variadic?   false
-                                       :params      [{:op        :binding
-                                                      :form      name
-                                                      :name      name
-                                                      :local     :arg
-                                                      :arg-id    0
-                                                      :variadic? false
-                                                      :atom      aatom
-                                                      :children  []}]
-                                       :fixed-arity 1
-                                       :body        {:op         :do
-                                                     :statements []
-                                                     :ret        (f acomp)
-                                                     :body?      true
-                                                     :children   [:statements :ret]}
-                                       :children    [:params :body]}]
-                    :once            false
-                    :children        [:methods]}]
-     :children    [:fn :args]}))
+(defn- emit-bind
+  ([computation f]
+   (let [name (gensym 'v)
+         binding {:op        :binding
+                  :form      name
+                  :name      name
+                  :local     :arg
+                  :arg-id    0
+                  :variadic? false
+                  :atom      (atom nil)
+                  :children  []}]
+     (emit-bind computation binding f)))
+  ([computation binding f]
+   (let [acomp {:op          :local
+                :form        (:name binding)
+                :name        (:name binding)
+                :assignable? false
+                :local       :arg
+                :arg-id      0
+                :variadic?   false
+                :atom        (:atom binding)}
+         recur-label (gensym 'recur)]
+     {:op          :protocol-invoke
+      :protocol-fn {:op   :var
+                    :form `flat-map
+                    :var  #'flat-map}
+      :target      computation
+      :args        [{:op              :fn
+                     :variadic?       false
+                     :max-fixed-arity 1
+                     :methods         [{:op          :fn-method
+                                        :loop-id     recur-label
+                                        :variadic?   false
+                                        :params      [binding]
+                                        :fixed-arity 1
+                                        :body        {:op         :do
+                                                      :statements []
+                                                      :ret        (f acomp)
+                                                      :body?      true
+                                                      :children   [:statements :ret]}
+                                        :children    [:params :body]}]
+                     :once            false
+                     :children        [:methods]}]
+      :children    [:fn :args]})))
 
 (declare ->NamedCont continue)
 
@@ -297,6 +303,29 @@
   (continue [_ expr] (convert-if-branches parent orig-node expr))
   (continue-computation [_ computation] (emit-bind computation (partial convert-if-branches parent orig-node))))
 
+(declare ->LetCont)
+
+(deftype LetCont [parent orig-node index]
+  IsTrivial
+  (trivial? [_] false)
+
+  ContEmitter
+  (continue [_ {:keys [init] :as binding}]
+    (trivializing init binding (fn [_]
+                                 (let [{:keys [bindings body]} orig-node
+                                       index (inc index)]
+                                   (if (< index (count bindings))
+                                     (convert (->LetCont parent orig-node index) (get bindings index))
+                                     (convert parent body))))))
+
+  (continue-computation [_ {:keys [init] :as binding}]
+    (emit-bind init binding (fn [_]
+                              (let [{:keys [bindings body]} orig-node
+                                    index (inc index)]
+                                (if (< index (count bindings))
+                                  (convert (->LetCont parent orig-node index) (get bindings index))
+                                  (convert parent body)))))))
+
 (deftype BindCont [parent]
   IsTrivial
   (trivial? [_] false)
@@ -340,16 +369,19 @@
           (fn [_cont {:keys [op]}]
             (case op
               (:def :do :host-interop :instance-call :instance-field :instance? :keyword-invoke :map :monitor-enter
-                :monitor-exit :new :primitive-invoke :protocol-invoke :set :set! :static-call :vector :with-meta)
+                :monitor-exit :new :primitive-invoke :protocol-invoke :set :set! :static-call :vector :with-meta
+                :binding)
               ::basic-block
+
+              (:let :letfn) ::let
 
               op)))
 
-;;; TODO: Local binding, probably straightforward: let letfn binding
+;;; TODO: Local binding, probably straightforward: letfn
 ;;;       Function-type things, treated like constants: fn fn-method deftype reify method
 ;;;       Never ::monadic (?): (const quote local static-field the-var var import)
 ;;;       Loop, needs to be trampolined: loop recur
-;;;       Exceptions, maybe use something like MonadError (?): try catch throw
+;;;       Exceptions, maybe usdo b <-e something like MonadError (?): try catch throw
 
 (defn- convert-basic-block [cont ast]
   (if-let [[child path] (first-path ast)]
@@ -363,6 +395,11 @@
 
 (defmethod convert-monadic :if [cont {:keys [test] :as ast}]
   (trivializing-cont cont (fn [k] (convert (->IfCont k ast) test))))
+
+(defmethod convert-monadic ::let [cont {:keys [bindings body] :as ast}]
+  (if (seq bindings)
+    (convert (->LetCont cont ast 0) (first bindings))
+    (convert cont body)))
 
 (defmethod convert-monadic :invoke [cont ast]
   (if (!-node? ast)
